@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from pi_py.agent_core.event_stream import AssistantMessageEventStream, EventStream
-from pi_py.agent_core.types import AssistantMessage, StopReason, TextContent, Usage
+from pi_agent.agent_core.event_stream import AssistantMessageEventStream, EventStream
+from pi_agent.agent_core.types import AssistantMessage, StopReason, TextContent, Usage
 
 
 def make_assistant(text: str, stop_reason: StopReason = "stop") -> AssistantMessage:

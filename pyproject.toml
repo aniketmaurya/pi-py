@@ -1,8 +1,19 @@
 [project]
-name = "pi-py"
+name = "pi-agent"
 version = "0.1.0"
 description = "Python tools for building AI agents and managing LLM deployments"
 readme = "README.md"
+keywords = ["ai", "agents", "llm", "tool-calling", "sdk"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 authors = [
     { name = "Aniket Maurya", email = "theaniketmaurya@gmail.com" }
 ]
@@ -10,6 +21,11 @@ requires-python = ">=3.11"
 dependencies = [
     "jsonschema>=4.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/aniketmaurya/pi-py"
+Repository = "https://github.com/aniketmaurya/pi-py"
+Issues = "https://github.com/aniketmaurya/pi-py/issues"
 
 [project.optional-dependencies]
 openai = [

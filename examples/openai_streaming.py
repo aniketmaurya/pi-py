@@ -4,9 +4,14 @@ import asyncio
 import os
 from typing import cast
 
-from pi_py.agent_core import AssistantMessage, Model, TextContent, ToolCall
-from pi_py.agent_core.types import ErrorEvent, TextDeltaEvent, ToolCallDeltaEvent, ToolCallEndEvent
-from pi_py.pi_ai import create_default_registry, stream_simple
+from pi_agent.agent_core import AssistantMessage, Model, TextContent, ToolCall
+from pi_agent.agent_core.types import (
+    ErrorEvent,
+    TextDeltaEvent,
+    ToolCallDeltaEvent,
+    ToolCallEndEvent,
+)
+from pi_agent.pi_ai import create_default_registry, stream_simple
 
 
 def extract_assistant_text(message: AssistantMessage) -> str:

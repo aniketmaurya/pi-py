@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from pi_py.agent_core import Model
-from pi_py.pi_ai import ProviderRegistry, create_default_registry
-from pi_py.pi_ai.providers import MockProvider
+from pi_agent.agent_core import Model
+from pi_agent.pi_ai import ProviderRegistry, create_default_registry
+from pi_agent.pi_ai.providers import MockProvider
 
 
 def test_registry_prefers_api_over_provider() -> None:

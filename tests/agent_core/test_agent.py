@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from pi_py.agent_core import (
+from pi_agent.agent_core import (
     Agent,
     AgentLoopConfig,
     AssistantMessageEventStream,
@@ -12,7 +12,7 @@ from pi_py.agent_core import (
     Model,
     TextContent,
 )
-from pi_py.agent_core.types import AssistantMessage, StopReason, Usage
+from pi_agent.agent_core.types import AssistantMessage, StopReason, Usage
 
 
 def make_assistant(text: str, *, stop_reason: StopReason = "stop") -> AssistantMessage:

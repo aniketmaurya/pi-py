@@ -5,7 +5,7 @@ import os
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from pi_py.agent_core import (
+from pi_agent.agent_core import (
     Agent,
     AgentEvent,
     AgentTool,
@@ -14,7 +14,7 @@ from pi_py.agent_core import (
     Model,
     TextContent,
 )
-from pi_py.pi_ai import create_agent_stream_fn, create_default_registry
+from pi_agent.pi_ai import create_agent_stream_fn, create_default_registry
 
 
 def extract_assistant_text(message: AssistantMessage) -> str:

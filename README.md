@@ -1,4 +1,4 @@
-# pi-py
+# pi-agent
 
 Python tools for building AI agents and managing LLM deployments.
 
@@ -26,6 +26,16 @@ Roadmap details are tracked in [`PLAN.md`](./PLAN.md).
 - Python `>=3.11`
 - [`uv`](https://docs.astral.sh/uv/)
 
+## Install
+
+```bash
+pip install pi-agent
+```
+
+```python
+from pi_agent.agent_core import Agent, Model
+```
+
 ## Development
 
 ```bash
@@ -38,13 +48,13 @@ uv run pytest -q
 ## Package layout
 
 ```text
-src/pi_py/agent_core/
+src/pi_agent/agent_core/
   types.py         # domain model + event types + runtime protocols
   event_stream.py  # generic async stream + assistant stream specialization
   agent_loop.py    # turn execution + tool execution loop
   agent.py         # high-level agent state wrapper
 
-src/pi_py/pi_ai/
+src/pi_agent/pi_ai/
   types.py         # provider request + provider protocol
   registry.py      # provider registry + defaults
   runtime.py       # stream/complete APIs + Agent adapter
@@ -76,3 +86,11 @@ uv run python examples/openai_streaming.py
 ```
 
 This example prints streaming delta events (`text_delta`, and tool-call events when present) from the OpenAI provider.
+
+## Build and publish
+
+```bash
+uv build
+uvx twine check dist/*
+uv publish
+```

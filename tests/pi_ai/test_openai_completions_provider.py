@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from pi_py.agent_core import (
+from pi_agent.agent_core import (
     AgentTool,
     AgentToolResult,
     AssistantMessage,
@@ -20,8 +20,8 @@ from pi_py.agent_core import (
     ToolResultMessage,
     UserMessage,
 )
-from pi_py.pi_ai import OpenAICompletionsProvider, PiAIRequest
-from pi_py.pi_ai.providers.openai_completions import _chunk_to_mapping, _response_to_mapping
+from pi_agent.pi_ai import OpenAICompletionsProvider, PiAIRequest
+from pi_agent.pi_ai.providers.openai_completions import _chunk_to_mapping, _response_to_mapping
 
 
 async def _noop_execute(
@@ -158,7 +158,7 @@ async def test_openai_completions_provider_emits_text_response() -> None:
 async def test_openai_completions_provider_requires_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("PI_PY_TEST_OPENAI_KEY", raising=False)
+    monkeypatch.delenv("PI_AGENT_TEST_OPENAI_KEY", raising=False)
 
     async def should_not_run(
         _payload: dict[str, Any],
@@ -169,7 +169,7 @@ async def test_openai_completions_provider_requires_api_key(
 
     provider = OpenAICompletionsProvider(
         request_fn=should_not_run,
-        api_key_env="PI_PY_TEST_OPENAI_KEY",
+        api_key_env="PI_AGENT_TEST_OPENAI_KEY",
     )
     request = PiAIRequest(
         model=Model(id="gpt-5-mini", provider="openai", api="openai-completions"),

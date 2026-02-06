@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from pi_py.agent_core import (
+from pi_agent.agent_core import (
     Agent,
     AgentTool,
     AgentToolResult,
@@ -18,7 +18,12 @@ from pi_py.agent_core import (
     ToolResultMessage,
     UserMessage,
 )
-from pi_py.pi_ai import complete, complete_simple, create_agent_stream_fn, create_default_registry
+from pi_agent.pi_ai import (
+    complete,
+    complete_simple,
+    create_agent_stream_fn,
+    create_default_registry,
+)
 
 
 def _assistant_text(message: AssistantMessage) -> str:

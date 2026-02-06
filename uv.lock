@@ -376,7 +376,7 @@ wheels = [
 ]
 
 [[package]]
-name = "pi-py"
+name = "pi-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

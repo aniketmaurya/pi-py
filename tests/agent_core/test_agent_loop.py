@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from pi_py.agent_core import (
+from pi_agent.agent_core import (
     AgentContext,
     AgentLoopConfig,
     AgentTool,
@@ -23,7 +23,7 @@ from pi_py.agent_core import (
     agent_loop,
     default_convert_to_llm,
 )
-from pi_py.agent_core.types import (
+from pi_agent.agent_core.types import (
     AgentMessage,
     AssistantContentBlock,
     AssistantMessageEvent,

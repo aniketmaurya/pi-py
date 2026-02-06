@@ -1,4 +1,4 @@
-# pi-py Roadmap (Python >= 3.11)
+# pi-agent Roadmap (Python >= 3.11)
 
 This project aims to provide an open source Python library equivalent in spirit to Pi (JS/TS), so developers can build agentic apps, SDKs, CLIs, and integrations on top of a composable core.
 
