@@ -3,6 +3,7 @@ from .agent_loop import agent_loop, agent_loop_continue
 from .event_stream import AssistantMessageEventStream, EventStream
 from .types import (
     AgentContext,
+    AgentEvent,
     AgentLoopConfig,
     AgentMessage,
     AgentState,
@@ -28,6 +29,7 @@ from .types import (
 __all__ = [
     "Agent",
     "AgentContext",
+    "AgentEvent",
     "AgentLoopConfig",
     "AgentMessage",
     "AgentState",

@@ -38,4 +38,20 @@ src/pi_py/agent_core/
   event_stream.py  # generic async stream + assistant stream specialization
   agent_loop.py    # turn execution + tool execution loop
   agent.py         # high-level agent state wrapper
+
+src/pi_py/pi_ai/
+  types.py         # provider request + provider protocol
+  registry.py      # provider registry + defaults
+  runtime.py       # stream/complete APIs + Agent adapter
+  providers/mock.py
 ```
+
+## End-to-end example
+
+Run:
+
+```bash
+uv run python examples/agent_e2e.py
+```
+
+This example creates an `Agent`, routes model calls through the new `pi_ai` runtime layer, invokes a tool, and prints the final assistant response.

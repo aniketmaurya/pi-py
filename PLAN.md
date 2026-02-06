@@ -62,6 +62,15 @@ Current status:
 - Tool argument validation and partial JSON parsing for streamed tool calls.
 - Model catalog + cost/token accounting foundation.
 
+Current status:
+
+- Initial Phase 2 slice implemented:
+  - `pi_ai` provider contract + registry
+  - unified runtime APIs (`stream`, `complete`, `stream_simple`, `complete_simple`)
+  - Agent adapter (`create_agent_stream_fn`)
+  - mock provider for deterministic local development
+- End-to-end `Agent` example added and tested.
+
 ### Phase 3: SDK Session Layer
 
 - `create_agent_session` and `AgentSession` abstraction.
