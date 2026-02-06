@@ -13,7 +13,7 @@ Phase 1 and an initial Phase 2 slice are implemented:
 - Agent loop runtime with turn/tool orchestration and steering/follow-up queues
 - Stateful `Agent` wrapper with prompt/continue/abort/wait APIs
 - Provider abstraction (`pi_ai`) with registry + runtime adapter
-- Providers: mock provider and initial OpenAI Responses provider
+- Providers: mock provider and OpenAI Responses provider (with streaming deltas)
 - Strict checks and tests (`ruff`, `mypy`, `pytest`)
 
 Roadmap details are tracked in [`PLAN.md`](./PLAN.md).
@@ -60,3 +60,15 @@ uv run python examples/agent_e2e.py
 ```
 
 This example uses OpenAI (`gpt-5-mini`), routes calls through `pi_ai`, invokes a tool, and prints the final assistant response.
+
+## Streaming example (OpenAI)
+
+Run:
+
+```bash
+uv sync --extra openai
+export OPENAI_API_KEY=your_key_here
+uv run python examples/openai_streaming.py
+```
+
+This example prints streaming delta events (`text_delta`, and tool-call events when present) from the OpenAI provider.

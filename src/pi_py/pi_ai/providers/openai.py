@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import inspect
 import json
 import os
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, Literal, TypeAlias, cast
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Literal, TypeAlias, TypeVar, cast
 
 from ...agent_core.event_stream import AssistantMessageEventStream
 from ...agent_core.types import (
@@ -32,11 +34,17 @@ OpenAIRequestFn: TypeAlias = Callable[
     [dict[str, Any], str, str | None],
     Awaitable[Mapping[str, Any]],
 ]
+OpenAIStreamRequestFn: TypeAlias = Callable[
+    [dict[str, Any], str, str | None],
+    AsyncIterator[Mapping[str, Any]] | Awaitable[AsyncIterator[Mapping[str, Any]]],
+]
+T = TypeVar("T")
 
 
 @dataclass(slots=True)
 class OpenAIResponsesProvider:
     request_fn: OpenAIRequestFn | None = None
+    stream_request_fn: OpenAIStreamRequestFn | None = None
     api_key_env: str = "OPENAI_API_KEY"
 
     async def stream(
@@ -74,33 +82,32 @@ class OpenAIResponsesProvider:
             api_key = _resolve_api_key(request, self.api_key_env)
             payload = _build_openai_payload(request)
             base_url = request.model.base_url or None
-            response = await self._request(payload, api_key, base_url)
-            assistant_message = _assistant_from_openai_response(
-                request.model,
-                response,
-            )
 
-            if assistant_message.stop_reason in {"error", "aborted"}:
-                stream.push(
-                    {
-                        "type": "error",
-                        "reason": (
-                            "aborted"
-                            if assistant_message.stop_reason == "aborted"
-                            else "error"
-                        ),
-                        "error": assistant_message,
-                    }
+            if self.stream_request_fn is not None:
+                events = await _maybe_await(
+                    self.stream_request_fn(payload, api_key, base_url)
+                )
+                await _consume_openai_event_stream(
+                    stream=stream,
+                    model=request.model,
+                    events=events,
                 )
                 return
 
-            done_reason = _done_reason_for_message(assistant_message)
-            stream.push(
-                {
-                    "type": "done",
-                    "reason": done_reason,
-                    "message": assistant_message,
-                }
+            if self.request_fn is not None:
+                response = await self.request_fn(payload, api_key, base_url)
+                assistant_message = _assistant_from_openai_response(
+                    request.model,
+                    response,
+                )
+                _push_terminal_message(stream, assistant_message)
+                return
+
+            events = _stream_openai_events(payload, api_key, base_url)
+            await _consume_openai_event_stream(
+                stream=stream,
+                model=request.model,
+                events=events,
             )
         except Exception as exc:  # noqa: BLE001
             stream.push(
@@ -115,15 +122,538 @@ class OpenAIResponsesProvider:
                 }
             )
 
-    async def _request(
-        self,
-        payload: dict[str, Any],
-        api_key: str,
-        base_url: str | None,
-    ) -> dict[str, Any]:
-        if self.request_fn is not None:
-            return dict(await self.request_fn(payload, api_key, base_url))
-        return await _request_openai_response(payload, api_key, base_url)
+
+@dataclass(slots=True)
+class _OpenAIStreamingState:
+    partial: AssistantMessage
+    text_indices: dict[tuple[int, int], int] = field(default_factory=dict)
+    closed_text_indices: set[int] = field(default_factory=set)
+    tool_indices: dict[str, int] = field(default_factory=dict)
+    closed_tool_call_ids: set[str] = field(default_factory=set)
+    tool_arg_buffers: dict[str, str] = field(default_factory=dict)
+
+
+def _push_terminal_message(
+    stream: AssistantMessageEventStream,
+    message: AssistantMessage,
+) -> None:
+    if message.stop_reason in {"error", "aborted"}:
+        stream.push(
+            {
+                "type": "error",
+                "reason": "aborted" if message.stop_reason == "aborted" else "error",
+                "error": message,
+            }
+        )
+        return
+
+    stream.push(
+        {
+            "type": "done",
+            "reason": _done_reason_for_message(message),
+            "message": message,
+        }
+    )
+
+
+async def _consume_openai_event_stream(
+    *,
+    stream: AssistantMessageEventStream,
+    model: Model,
+    events: AsyncIterator[Mapping[str, Any]],
+) -> None:
+    state = _OpenAIStreamingState(partial=_new_partial_message(model))
+    stream.push({"type": "start", "partial": state.partial})
+
+    completed = False
+    async for raw_event in events:
+        event = _event_to_mapping(raw_event)
+        completed = _apply_openai_stream_event(
+            stream=stream,
+            model=model,
+            state=state,
+            event=event,
+        )
+        if completed:
+            break
+
+    if completed:
+        return
+
+    _close_open_text_blocks(state, stream)
+    _close_open_tool_calls(state, stream)
+    _push_terminal_message(stream, _clone_assistant_message(state.partial))
+
+
+def _apply_openai_stream_event(
+    *,
+    stream: AssistantMessageEventStream,
+    model: Model,
+    state: _OpenAIStreamingState,
+    event: Mapping[str, Any],
+) -> bool:
+    event_type = _as_str(event.get("type")) or ""
+
+    if _event_type_matches(
+        event_type,
+        (
+            "response.output_text.delta",
+            "response.text.delta",
+            "output_text.delta",
+        ),
+    ):
+        delta = _as_str(event.get("delta")) or ""
+        if not delta:
+            return False
+
+        content_index = _ensure_text_block(
+            state=state,
+            stream=stream,
+            event=event,
+        )
+        text_block = cast(TextContent, state.partial.content[content_index])
+        text_block.text += delta
+        stream.push(
+            {
+                "type": "text_delta",
+                "content_index": content_index,
+                "delta": delta,
+                "partial": state.partial,
+            }
+        )
+        return False
+
+    if _event_type_matches(
+        event_type,
+        (
+            "response.output_text.done",
+            "response.text.done",
+            "output_text.done",
+        ),
+    ):
+        content_index = _ensure_text_block(
+            state=state,
+            stream=stream,
+            event=event,
+        )
+        text_block = cast(TextContent, state.partial.content[content_index])
+        final_text = _as_str(event.get("text"))
+        if final_text and not text_block.text:
+            text_block.text = final_text
+        _emit_text_end_if_needed(state, stream, content_index)
+        return False
+
+    if _event_type_matches(
+        event_type,
+        ("response.output_item.added", "output_item.added"),
+    ):
+        item = event.get("item") or event.get("output_item")
+        if isinstance(item, Mapping):
+            _apply_output_item(
+                state=state,
+                stream=stream,
+                item=item,
+                close_text=False,
+            )
+        return False
+
+    if _event_type_matches(
+        event_type,
+        ("response.output_item.done", "output_item.done"),
+    ):
+        item = event.get("item") or event.get("output_item")
+        if isinstance(item, Mapping):
+            _apply_output_item(
+                state=state,
+                stream=stream,
+                item=item,
+                close_text=True,
+            )
+        return False
+
+    if _event_type_matches(
+        event_type,
+        (
+            "response.function_call_arguments.delta",
+            "response.output_item.function_call_arguments.delta",
+            "function_call_arguments.delta",
+        ),
+    ):
+        call_id = _event_call_id(event)
+        if not call_id:
+            return False
+
+        content_index = _ensure_tool_call(
+            state=state,
+            stream=stream,
+            call_id=call_id,
+            name=_event_tool_name(event),
+        )
+        delta = _as_str(event.get("delta")) or ""
+        if delta:
+            state.tool_arg_buffers[call_id] = (
+                state.tool_arg_buffers.get(call_id, "") + delta
+            )
+            stream.push(
+                {
+                    "type": "toolcall_delta",
+                    "content_index": content_index,
+                    "delta": delta,
+                    "partial": state.partial,
+                }
+            )
+        return False
+
+    if _event_type_matches(
+        event_type,
+        (
+            "response.function_call_arguments.done",
+            "response.output_item.function_call_arguments.done",
+            "function_call_arguments.done",
+        ),
+    ):
+        call_id = _event_call_id(event)
+        if not call_id:
+            return False
+
+        content_index = _ensure_tool_call(
+            state=state,
+            stream=stream,
+            call_id=call_id,
+            name=_event_tool_name(event),
+        )
+        tool_call = cast(ToolCall, state.partial.content[content_index])
+        args_str = _as_str(event.get("arguments")) or state.tool_arg_buffers.get(
+            call_id,
+            "",
+        )
+        tool_call.arguments = _extract_tool_call_arguments(args_str)
+        _emit_tool_end_if_needed(state, stream, call_id)
+        return False
+
+    if _event_type_matches(event_type, ("response.completed", "completed")):
+        response = event.get("response")
+        _close_open_text_blocks(state, stream)
+        _close_open_tool_calls(state, stream)
+        if isinstance(response, Mapping):
+            final_message = _assistant_from_openai_response(model, response)
+        else:
+            final_message = _clone_assistant_message(state.partial)
+        _push_terminal_message(stream, final_message)
+        return True
+
+    if _event_type_matches(
+        event_type,
+        ("response.failed", "response.error", "response.cancelled", "error"),
+    ):
+        error_message = _error_message_from_event(event)
+        if "cancel" in event_type:
+            stream.push(
+                {
+                    "type": "error",
+                    "reason": "aborted",
+                    "error": _assistant_error_message(
+                        model=model,
+                        stop_reason="aborted",
+                        error_message=error_message,
+                    ),
+                }
+            )
+        else:
+            stream.push(
+                {
+                    "type": "error",
+                    "reason": "error",
+                    "error": _assistant_error_message(
+                        model=model,
+                        stop_reason="error",
+                        error_message=error_message,
+                    ),
+                }
+            )
+        return True
+
+    return False
+
+
+def _apply_output_item(
+    *,
+    state: _OpenAIStreamingState,
+    stream: AssistantMessageEventStream,
+    item: Mapping[str, Any],
+    close_text: bool,
+) -> None:
+    item_type = _as_str(item.get("type"))
+    if item_type == "function_call":
+        call_id = _as_str(item.get("call_id")) or _as_str(item.get("id"))
+        if not call_id:
+            return
+        content_index = _ensure_tool_call(
+            state=state,
+            stream=stream,
+            call_id=call_id,
+            name=_as_str(item.get("name")),
+        )
+        tool_call = cast(ToolCall, state.partial.content[content_index])
+        args_raw = item.get("arguments")
+        if isinstance(args_raw, Mapping):
+            tool_call.arguments = {str(key): value for key, value in args_raw.items()}
+        elif isinstance(args_raw, str):
+            state.tool_arg_buffers[call_id] = args_raw
+        return
+
+    if item_type != "message":
+        return
+
+    for part in _as_mapping_list(item.get("content")):
+        part_type = _as_str(part.get("type"))
+        if part_type not in {"output_text", "text"}:
+            continue
+
+        text = _as_str(part.get("text"))
+        if not text:
+            continue
+
+        event = {
+            "output_index": _as_int(item.get("output_index")),
+            "content_index": _as_int(part.get("index")),
+        }
+        content_index = _ensure_text_block(
+            state=state,
+            stream=stream,
+            event=event,
+        )
+        text_block = cast(TextContent, state.partial.content[content_index])
+        delta = _trailing_text_delta(current=text_block.text, observed=text)
+        if delta:
+            text_block.text += delta
+            stream.push(
+                {
+                    "type": "text_delta",
+                    "content_index": content_index,
+                    "delta": delta,
+                    "partial": state.partial,
+                }
+            )
+        if close_text:
+            _emit_text_end_if_needed(state, stream, content_index)
+
+
+def _trailing_text_delta(*, current: str, observed: str) -> str:
+    if not observed:
+        return ""
+    if not current:
+        return observed
+    if observed.startswith(current):
+        return observed[len(current) :]
+    if current.startswith(observed):
+        return ""
+
+    max_overlap = min(len(current), len(observed))
+    for overlap in range(max_overlap, 0, -1):
+        if current.endswith(observed[:overlap]):
+            return observed[overlap:]
+    return observed
+
+
+def _ensure_text_block(
+    *,
+    state: _OpenAIStreamingState,
+    stream: AssistantMessageEventStream,
+    event: Mapping[str, Any],
+) -> int:
+    key = (_as_int(event.get("output_index")), _as_int(event.get("content_index")))
+    existing = state.text_indices.get(key)
+    if existing is not None:
+        return existing
+
+    content_index = len(state.partial.content)
+    state.partial.content.append(TextContent(text=""))
+    state.text_indices[key] = content_index
+    stream.push(
+        {
+            "type": "text_start",
+            "content_index": content_index,
+            "partial": state.partial,
+        }
+    )
+    return content_index
+
+
+def _emit_text_end_if_needed(
+    state: _OpenAIStreamingState,
+    stream: AssistantMessageEventStream,
+    content_index: int,
+) -> None:
+    if content_index in state.closed_text_indices:
+        return
+
+    content = state.partial.content[content_index]
+    if not isinstance(content, TextContent):
+        return
+
+    stream.push(
+        {
+            "type": "text_end",
+            "content_index": content_index,
+            "content": content.text,
+            "partial": state.partial,
+        }
+    )
+    state.closed_text_indices.add(content_index)
+
+
+def _close_open_text_blocks(
+    state: _OpenAIStreamingState,
+    stream: AssistantMessageEventStream,
+) -> None:
+    for content_index in list(state.text_indices.values()):
+        _emit_text_end_if_needed(state, stream, content_index)
+
+
+def _ensure_tool_call(
+    *,
+    state: _OpenAIStreamingState,
+    stream: AssistantMessageEventStream,
+    call_id: str,
+    name: str | None,
+) -> int:
+    existing = state.tool_indices.get(call_id)
+    if existing is not None:
+        tool_call = state.partial.content[existing]
+        if isinstance(tool_call, ToolCall) and name:
+            tool_call.name = name
+        return existing
+
+    content_index = len(state.partial.content)
+    tool_call = ToolCall(id=call_id, name=name or "tool", arguments={})
+    state.partial.content.append(tool_call)
+    state.tool_indices[call_id] = content_index
+    state.tool_arg_buffers.setdefault(call_id, "")
+    stream.push(
+        {
+            "type": "toolcall_start",
+            "content_index": content_index,
+            "partial": state.partial,
+        }
+    )
+    return content_index
+
+
+def _emit_tool_end_if_needed(
+    state: _OpenAIStreamingState,
+    stream: AssistantMessageEventStream,
+    call_id: str,
+) -> None:
+    if call_id in state.closed_tool_call_ids:
+        return
+
+    content_index = state.tool_indices.get(call_id)
+    if content_index is None:
+        return
+
+    content = state.partial.content[content_index]
+    if not isinstance(content, ToolCall):
+        return
+
+    stream.push(
+        {
+            "type": "toolcall_end",
+            "content_index": content_index,
+            "tool_call": content,
+            "partial": state.partial,
+        }
+    )
+    state.closed_tool_call_ids.add(call_id)
+
+
+def _close_open_tool_calls(
+    state: _OpenAIStreamingState,
+    stream: AssistantMessageEventStream,
+) -> None:
+    for call_id, content_index in state.tool_indices.items():
+        if call_id in state.closed_tool_call_ids:
+            continue
+
+        content = state.partial.content[content_index]
+        if isinstance(content, ToolCall) and not content.arguments:
+            args_str = state.tool_arg_buffers.get(call_id, "")
+            if args_str:
+                content.arguments = _extract_tool_call_arguments(args_str)
+
+        _emit_tool_end_if_needed(state, stream, call_id)
+
+
+def _event_type_matches(event_type: str, patterns: Sequence[str]) -> bool:
+    return any(event_type == pattern or event_type.endswith(pattern) for pattern in patterns)
+
+
+def _event_call_id(event: Mapping[str, Any]) -> str | None:
+    call_id = _as_str(event.get("call_id"))
+    if call_id:
+        return call_id
+    return _as_str(event.get("item_id")) or _as_str(event.get("id"))
+
+
+def _event_tool_name(event: Mapping[str, Any]) -> str | None:
+    return _as_str(event.get("name"))
+
+
+def _error_message_from_event(event: Mapping[str, Any]) -> str:
+    error = event.get("error")
+    if isinstance(error, Mapping):
+        message = _as_str(error.get("message"))
+        if message:
+            return message
+
+    message = _as_str(event.get("message"))
+    if message:
+        return message
+    return "OpenAI response failed."
+
+
+def _new_partial_message(model: Model) -> AssistantMessage:
+    return AssistantMessage(
+        content=[],
+        api=model.api,
+        provider=model.provider,
+        model=model.id,
+        usage=Usage(cost=UsageCost()),
+        stop_reason="stop",
+    )
+
+
+def _clone_assistant_message(message: AssistantMessage) -> AssistantMessage:
+    cloned_content: list[AssistantContentBlock] = []
+    for block in message.content:
+        if isinstance(block, TextContent):
+            cloned_content.append(
+                TextContent(
+                    text=block.text,
+                    text_signature=block.text_signature,
+                )
+            )
+            continue
+
+        if isinstance(block, ToolCall):
+            cloned_content.append(
+                ToolCall(
+                    id=block.id,
+                    name=block.name,
+                    arguments=dict(block.arguments),
+                    thought_signature=block.thought_signature,
+                )
+            )
+
+    return AssistantMessage(
+        content=cloned_content,
+        api=message.api,
+        provider=message.provider,
+        model=message.model,
+        usage=message.usage,
+        stop_reason=message.stop_reason,
+        error_message=message.error_message,
+    )
 
 
 def _resolve_api_key(request: PiAIRequest, api_key_env: str) -> str:
@@ -198,9 +728,7 @@ def _to_openai_user_item(message: UserMessage) -> dict[str, Any]:
             content_items.append(
                 {
                     "type": "input_image",
-                    "image_url": (
-                        f"data:{block.mime_type};base64,{block.data}"
-                    ),
+                    "image_url": f"data:{block.mime_type};base64,{block.data}",
                 }
             )
 
@@ -218,12 +746,7 @@ def _to_openai_assistant_items(message: AssistantMessage) -> list[dict[str, Any]
         if isinstance(block, TextContent) and block.text
     ]
     if text_chunks:
-        items.append(
-            {
-                "role": "assistant",
-                "content": "\n".join(text_chunks),
-            }
-        )
+        items.append({"role": "assistant", "content": "\n".join(text_chunks)})
 
     for block in message.content:
         if isinstance(block, ToolCall):
@@ -469,42 +992,141 @@ def _as_int(value: Any) -> int:
     return 0
 
 
-async def _request_openai_response(
-    payload: dict[str, Any],
-    api_key: str,
-    base_url: str | None,
-) -> dict[str, Any]:
+def _event_to_mapping(event: Mapping[str, Any] | Any) -> dict[str, Any]:
+    if isinstance(event, Mapping):
+        return dict(event)
+
+    to_dict = getattr(event, "to_dict", None)
+    if callable(to_dict):
+        try:
+            dumped = to_dict(warnings=False)
+        except TypeError:
+            dumped = to_dict()
+        if isinstance(dumped, Mapping):
+            return dict(dumped)
+
+    model_dump = getattr(event, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(warnings=False)
+        except TypeError:
+            dumped = model_dump()
+        if isinstance(dumped, Mapping):
+            return dict(dumped)
+
+    fields = (
+        "type",
+        "delta",
+        "text",
+        "call_id",
+        "item_id",
+        "id",
+        "name",
+        "output_index",
+        "content_index",
+        "arguments",
+        "item",
+        "output_item",
+        "response",
+        "error",
+        "message",
+    )
+    mapped: dict[str, Any] = {}
+    for field_name in fields:
+        if hasattr(event, field_name):
+            mapped[field_name] = getattr(event, field_name)
+    return mapped
+
+
+def _response_to_mapping(response: Mapping[str, Any] | Any) -> dict[str, Any]:
+    if isinstance(response, Mapping):
+        return dict(response)
+
+    to_dict = getattr(response, "to_dict", None)
+    if callable(to_dict):
+        try:
+            dumped = to_dict(warnings=False)
+        except TypeError:
+            dumped = to_dict()
+        if isinstance(dumped, Mapping):
+            return dict(dumped)
+
+    model_dump = getattr(response, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(warnings=False)
+        except TypeError:
+            dumped = model_dump()
+        if isinstance(dumped, Mapping):
+            return dict(dumped)
+
+    raise RuntimeError(
+        "Unsupported OpenAI response type. "
+        f"Expected mapping-like object, got: {type(response).__name__}"
+    )
+
+
+def _load_async_openai_class() -> Any:
     try:
-        from openai import AsyncOpenAI
+        openai_module = importlib.import_module("openai")
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "OpenAI provider requires the `openai` package. "
             "Install it with: uv add openai"
         ) from exc
 
+    async_openai = getattr(openai_module, "AsyncOpenAI", None)
+    if async_openai is None:
+        raise RuntimeError(
+            "Installed `openai` package does not expose AsyncOpenAI."
+        )
+    return async_openai
+
+
+async def _stream_openai_events(
+    payload: dict[str, Any],
+    api_key: str,
+    base_url: str | None,
+) -> AsyncIterator[Mapping[str, Any]]:
+    async_openai = _load_async_openai_class()
     client_kwargs: dict[str, Any] = {"api_key": api_key}
     if base_url:
         client_kwargs["base_url"] = base_url
 
-    async with AsyncOpenAI(**client_kwargs) as client:
+    async with async_openai(**client_kwargs) as client:
+        stream_factory = getattr(client.responses, "stream", None)
+        if not callable(stream_factory):
+            raise RuntimeError(
+                "Installed `openai` package does not support responses.stream."
+            )
+
+        async with stream_factory(**payload) as response_stream:
+            async for event in response_stream:
+                yield _event_to_mapping(event)
+
+            final_response = await response_stream.get_final_response()
+
+    yield {"type": "response.completed", "response": _response_to_mapping(final_response)}
+
+
+async def _request_openai_response(
+    payload: dict[str, Any],
+    api_key: str,
+    base_url: str | None,
+) -> dict[str, Any]:
+    async_openai = _load_async_openai_class()
+
+    client_kwargs: dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+
+    async with async_openai(**client_kwargs) as client:
         response = await client.responses.create(**payload)
 
-    if isinstance(response, Mapping):
-        return dict(response)
+    return _response_to_mapping(response)
 
-    model_dump = getattr(response, "model_dump", None)
-    if callable(model_dump):
-        dumped = model_dump()
-        if isinstance(dumped, Mapping):
-            return cast(dict[str, Any], dict(dumped))
 
-    to_dict = getattr(response, "to_dict", None)
-    if callable(to_dict):
-        dumped = to_dict()
-        if isinstance(dumped, Mapping):
-            return cast(dict[str, Any], dict(dumped))
-
-    raise RuntimeError(
-        "Unsupported OpenAI response type. "
-        f"Expected mapping-like object, got: {type(response).__name__}"
-    )
+async def _maybe_await(value: T | Awaitable[T]) -> T:
+    if inspect.isawaitable(value):
+        return await cast(Awaitable[T], value)
+    return value

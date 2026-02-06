@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
 import pytest
@@ -19,6 +19,7 @@ from pi_py.agent_core import (
     UserMessage,
 )
 from pi_py.pi_ai import OpenAIResponsesProvider, PiAIRequest
+from pi_py.pi_ai.providers.openai import _event_to_mapping, _response_to_mapping
 
 
 async def _noop_execute(
@@ -219,6 +220,186 @@ async def test_openai_provider_sends_tool_result_as_function_output() -> None:
     assert len(function_output_items) == 1
     assert function_output_items[0]["call_id"] == "call_berlin"
     assert "Sunny in Berlin" in function_output_items[0]["output"]
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_streams_text_deltas() -> None:
+    async def stream_request_fn(
+        _payload: dict[str, Any],
+        _api_key: str,
+        _base_url: str | None,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        async def _events() -> AsyncIterator[Mapping[str, Any]]:
+            yield {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "Hel",
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "lo",
+            }
+            yield {
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "Hello",
+            }
+            yield {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "output_index": 0,
+                    "content": [
+                        {"type": "output_text", "index": 0, "text": "Hello"},
+                    ],
+                },
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {"type": "output_text", "text": "Hello"},
+                            ],
+                        }
+                    ],
+                },
+            }
+
+        return _events()
+
+    provider = OpenAIResponsesProvider(stream_request_fn=stream_request_fn)
+    request = PiAIRequest(
+        model=Model(id="gpt-5", provider="openai", api="openai"),
+        context=LlmContext(messages=[UserMessage(content="Hello")]),
+        api_key="test-key",
+    )
+
+    stream = await provider.stream(request)
+    event_types: list[str] = []
+    text_deltas: list[str] = []
+    async for event in stream:
+        event_types.append(event["type"])
+        if event["type"] == "text_delta":
+            text_deltas.append(event["delta"])
+    message = await stream.result()
+
+    assert event_types == [
+        "start",
+        "text_start",
+        "text_delta",
+        "text_delta",
+        "text_end",
+        "done",
+    ]
+    assert text_deltas == ["Hel", "lo"]
+    assert message.stop_reason == "stop"
+    assert _assistant_text(message) == "Hello"
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_streams_tool_call_updates() -> None:
+    async def stream_request_fn(
+        _payload: dict[str, Any],
+        _api_key: str,
+        _base_url: str | None,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        async def _events() -> AsyncIterator[Mapping[str, Any]]:
+            yield {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_tokyo",
+                    "name": "get_weather",
+                },
+            }
+            yield {
+                "type": "response.function_call_arguments.delta",
+                "call_id": "call_tokyo",
+                "name": "get_weather",
+                "delta": '{"city":"Tok',
+            }
+            yield {
+                "type": "response.function_call_arguments.delta",
+                "call_id": "call_tokyo",
+                "name": "get_weather",
+                "delta": 'yo"}',
+            }
+            yield {
+                "type": "response.function_call_arguments.done",
+                "call_id": "call_tokyo",
+                "name": "get_weather",
+                "arguments": '{"city":"Tokyo"}',
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_tokyo",
+                            "name": "get_weather",
+                            "arguments": '{"city":"Tokyo"}',
+                        }
+                    ],
+                },
+            }
+
+        return _events()
+
+    provider = OpenAIResponsesProvider(stream_request_fn=stream_request_fn)
+    request = PiAIRequest(
+        model=Model(id="gpt-5", provider="openai", api="openai"),
+        context=LlmContext(messages=[UserMessage(content="Weather in Tokyo?")]),
+        api_key="test-key",
+    )
+
+    stream = await provider.stream(request)
+    event_types: list[str] = []
+    async for event in stream:
+        event_types.append(event["type"])
+    message = await stream.result()
+
+    tool_calls = [block for block in message.content if isinstance(block, ToolCall)]
+    assert event_types == [
+        "start",
+        "toolcall_start",
+        "toolcall_delta",
+        "toolcall_delta",
+        "toolcall_end",
+        "done",
+    ]
+    assert message.stop_reason == "toolUse"
+    assert len(tool_calls) == 1
+    assert tool_calls[0].arguments == {"city": "Tokyo"}
+
+
+def test_event_to_mapping_uses_warnings_false_for_model_dump() -> None:
+    class FakeEvent:
+        def model_dump(self, *, warnings: bool = True) -> Mapping[str, Any]:
+            assert warnings is False
+            return {"type": "response.completed"}
+
+    mapped = _event_to_mapping(FakeEvent())
+    assert mapped["type"] == "response.completed"
+
+
+def test_response_to_mapping_uses_warnings_false_for_model_dump() -> None:
+    class FakeResponse:
+        def model_dump(self, *, warnings: bool = True) -> Mapping[str, Any]:
+            assert warnings is False
+            return {"status": "completed", "output": []}
+
+    mapped = _response_to_mapping(FakeResponse())
+    assert mapped["status"] == "completed"
 
 
 async def _raise_if_called() -> Mapping[str, Any]:
