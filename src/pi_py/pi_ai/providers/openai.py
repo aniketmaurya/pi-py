@@ -20,6 +20,7 @@ from ...agent_core.types import (
     Model,
     StopReason,
     TextContent,
+    ThinkingContent,
     ThinkingLevel,
     ToolCall,
     ToolResultMessage,
@@ -128,6 +129,8 @@ class _OpenAIStreamingState:
     partial: AssistantMessage
     text_indices: dict[tuple[int, int], int] = field(default_factory=dict)
     closed_text_indices: set[int] = field(default_factory=set)
+    thinking_indices: dict[tuple[int, str], int] = field(default_factory=dict)
+    closed_thinking_indices: set[int] = field(default_factory=set)
     tool_indices: dict[str, int] = field(default_factory=dict)
     closed_tool_call_ids: set[str] = field(default_factory=set)
     tool_arg_buffers: dict[str, str] = field(default_factory=dict)
@@ -181,6 +184,7 @@ async def _consume_openai_event_stream(
         return
 
     _close_open_text_blocks(state, stream)
+    _close_open_thinking_blocks(state, stream)
     _close_open_tool_calls(state, stream)
     _push_terminal_message(stream, _clone_assistant_message(state.partial))
 
@@ -254,6 +258,7 @@ def _apply_openai_stream_event(
                 stream=stream,
                 item=item,
                 close_text=False,
+                output_index=_as_int(event.get("output_index")),
             )
         return False
 
@@ -268,6 +273,63 @@ def _apply_openai_stream_event(
                 stream=stream,
                 item=item,
                 close_text=True,
+                output_index=_as_int(event.get("output_index")),
+            )
+        return False
+
+    if _event_type_matches(
+        event_type,
+        (
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+            "reasoning_summary_text.delta",
+            "reasoning_text.delta",
+        ),
+    ):
+        delta = _as_str(event.get("delta")) or ""
+        if not delta:
+            return False
+
+        content_index = _ensure_thinking_block(
+            state=state,
+            stream=stream,
+            event=event,
+        )
+        thinking_block = cast(ThinkingContent, state.partial.content[content_index])
+        thinking_block.thinking += delta
+        stream.push(
+            {
+                "type": "thinking_delta",
+                "content_index": content_index,
+                "delta": delta,
+                "partial": state.partial,
+            }
+        )
+        return False
+
+    if _event_type_matches(
+        event_type,
+        (
+            "response.reasoning_summary_part.done",
+            "reasoning_summary_part.done",
+        ),
+    ):
+        content_index = _ensure_thinking_block(
+            state=state,
+            stream=stream,
+            event=event,
+        )
+        thinking_block = cast(ThinkingContent, state.partial.content[content_index])
+        delimiter = "\n\n"
+        if thinking_block.thinking and not thinking_block.thinking.endswith(delimiter):
+            thinking_block.thinking += delimiter
+            stream.push(
+                {
+                    "type": "thinking_delta",
+                    "content_index": content_index,
+                    "delta": delimiter,
+                    "partial": state.partial,
+                }
             )
         return False
 
@@ -334,6 +396,7 @@ def _apply_openai_stream_event(
     if _event_type_matches(event_type, ("response.completed", "completed")):
         response = event.get("response")
         _close_open_text_blocks(state, stream)
+        _close_open_thinking_blocks(state, stream)
         _close_open_tool_calls(state, stream)
         if isinstance(response, Mapping):
             final_message = _assistant_from_openai_response(model, response)
@@ -382,6 +445,7 @@ def _apply_output_item(
     stream: AssistantMessageEventStream,
     item: Mapping[str, Any],
     close_text: bool,
+    output_index: int,
 ) -> None:
     item_type = _as_str(item.get("type"))
     if item_type == "function_call":
@@ -402,6 +466,39 @@ def _apply_output_item(
             state.tool_arg_buffers[call_id] = args_raw
         return
 
+    if item_type == "reasoning":
+        event = {
+            "output_index": _as_int(item.get("output_index")) or output_index,
+            "item_id": _as_str(item.get("id")),
+            "summary_index": 0,
+        }
+        content_index = _ensure_thinking_block(
+            state=state,
+            stream=stream,
+            event=event,
+        )
+        thinking_block = cast(ThinkingContent, state.partial.content[content_index])
+        observed = _extract_reasoning_text(item)
+        delta = _trailing_text_delta(current=thinking_block.thinking, observed=observed)
+        if delta:
+            thinking_block.thinking += delta
+            stream.push(
+                {
+                    "type": "thinking_delta",
+                    "content_index": content_index,
+                    "delta": delta,
+                    "partial": state.partial,
+                }
+            )
+
+        signature = _serialize_reasoning_item(item)
+        if signature is not None:
+            thinking_block.thinking_signature = signature
+
+        if close_text:
+            _emit_thinking_end_if_needed(state, stream, content_index)
+        return
+
     if item_type != "message":
         return
 
@@ -415,7 +512,7 @@ def _apply_output_item(
             continue
 
         event = {
-            "output_index": _as_int(item.get("output_index")),
+            "output_index": _as_int(item.get("output_index")) or output_index,
             "content_index": _as_int(part.get("index")),
         }
         content_index = _ensure_text_block(
@@ -480,6 +577,35 @@ def _ensure_text_block(
     return content_index
 
 
+def _ensure_thinking_block(
+    *,
+    state: _OpenAIStreamingState,
+    stream: AssistantMessageEventStream,
+    event: Mapping[str, Any],
+) -> int:
+    output_index = _as_int(event.get("output_index"))
+    item_id = _as_str(event.get("item_id")) or _as_str(event.get("id"))
+    if not item_id:
+        item_id = f"reasoning-{output_index}-{_as_int(event.get('summary_index'))}"
+
+    key = (output_index, item_id)
+    existing = state.thinking_indices.get(key)
+    if existing is not None:
+        return existing
+
+    content_index = len(state.partial.content)
+    state.partial.content.append(ThinkingContent(thinking=""))
+    state.thinking_indices[key] = content_index
+    stream.push(
+        {
+            "type": "thinking_start",
+            "content_index": content_index,
+            "partial": state.partial,
+        }
+    )
+    return content_index
+
+
 def _emit_text_end_if_needed(
     state: _OpenAIStreamingState,
     stream: AssistantMessageEventStream,
@@ -503,12 +629,43 @@ def _emit_text_end_if_needed(
     state.closed_text_indices.add(content_index)
 
 
+def _emit_thinking_end_if_needed(
+    state: _OpenAIStreamingState,
+    stream: AssistantMessageEventStream,
+    content_index: int,
+) -> None:
+    if content_index in state.closed_thinking_indices:
+        return
+
+    content = state.partial.content[content_index]
+    if not isinstance(content, ThinkingContent):
+        return
+
+    stream.push(
+        {
+            "type": "thinking_end",
+            "content_index": content_index,
+            "content": content.thinking,
+            "partial": state.partial,
+        }
+    )
+    state.closed_thinking_indices.add(content_index)
+
+
 def _close_open_text_blocks(
     state: _OpenAIStreamingState,
     stream: AssistantMessageEventStream,
 ) -> None:
     for content_index in list(state.text_indices.values()):
         _emit_text_end_if_needed(state, stream, content_index)
+
+
+def _close_open_thinking_blocks(
+    state: _OpenAIStreamingState,
+    stream: AssistantMessageEventStream,
+) -> None:
+    for content_index in list(state.thinking_indices.values()):
+        _emit_thinking_end_if_needed(state, stream, content_index)
 
 
 def _ensure_tool_call(
@@ -635,6 +792,15 @@ def _clone_assistant_message(message: AssistantMessage) -> AssistantMessage:
             )
             continue
 
+        if isinstance(block, ThinkingContent):
+            cloned_content.append(
+                ThinkingContent(
+                    thinking=block.thinking,
+                    thinking_signature=block.thinking_signature,
+                )
+            )
+            continue
+
         if isinstance(block, ToolCall):
             cloned_content.append(
                 ToolCall(
@@ -705,14 +871,44 @@ def _to_openai_input(context: LlmContext) -> list[dict[str, Any]]:
             continue
 
         if isinstance(message, ToolResultMessage):
-            items.append(
+            items.extend(_to_openai_tool_result_items(message))
+
+    return items
+
+
+def _to_openai_tool_result_items(message: ToolResultMessage) -> list[dict[str, Any]]:
+    output_text = _tool_result_text(message)
+    has_images = any(isinstance(block, ImageContent) for block in message.content)
+    if not output_text and has_images:
+        output_text = "(see attached image)"
+
+    items: list[dict[str, Any]] = [
+        {
+            "type": "function_call_output",
+            "call_id": message.tool_call_id,
+            "output": output_text,
+        }
+    ]
+
+    if not has_images:
+        return items
+
+    image_message_content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": "Attached image(s) from tool result:",
+        }
+    ]
+    for block in message.content:
+        if isinstance(block, ImageContent):
+            image_message_content.append(
                 {
-                    "type": "function_call_output",
-                    "call_id": message.tool_call_id,
-                    "output": _tool_result_text(message),
+                    "type": "input_image",
+                    "image_url": f"data:{block.mime_type};base64,{block.data}",
                 }
             )
 
+    items.append({"role": "user", "content": image_message_content})
     return items
 
 
@@ -800,6 +996,12 @@ def _assistant_from_openai_response(
     content: list[AssistantContentBlock] = []
     for item in _as_mapping_list(response.get("output")):
         item_type = _as_str(item.get("type"))
+        if item_type == "reasoning":
+            thinking_content = _extract_reasoning_content(item)
+            if thinking_content is not None:
+                content.append(thinking_content)
+            continue
+
         if item_type == "message":
             content.extend(_extract_text_content(item))
             continue
@@ -828,6 +1030,7 @@ def _assistant_from_openai_response(
 
 def _extract_text_content(item: Mapping[str, Any]) -> list[TextContent]:
     blocks: list[TextContent] = []
+    text_signature = _as_str(item.get("id"))
     for part in _as_mapping_list(item.get("content")):
         part_type = _as_str(part.get("type"))
         if part_type not in {"output_text", "text"}:
@@ -835,8 +1038,50 @@ def _extract_text_content(item: Mapping[str, Any]) -> list[TextContent]:
 
         text = _as_str(part.get("text"))
         if text:
-            blocks.append(TextContent(text=text))
+            blocks.append(TextContent(text=text, text_signature=text_signature))
     return blocks
+
+
+def _extract_reasoning_content(item: Mapping[str, Any]) -> ThinkingContent | None:
+    reasoning_text = _extract_reasoning_text(item)
+    signature = _serialize_reasoning_item(item)
+    if not reasoning_text and signature is None:
+        return None
+    return ThinkingContent(thinking=reasoning_text, thinking_signature=signature)
+
+
+def _extract_reasoning_text(item: Mapping[str, Any]) -> str:
+    summary_texts = [
+        text
+        for text in (
+            _as_str(part.get("text"))
+            for part in _as_mapping_list(item.get("summary"))
+        )
+        if text
+    ]
+    if summary_texts:
+        return "\n\n".join(summary_texts)
+
+    content_texts = [
+        text
+        for text in (
+            _as_str(part.get("text"))
+            or _as_str(part.get("reasoning"))
+            or _as_str(part.get("summary"))
+            for part in _as_mapping_list(item.get("content"))
+        )
+        if text
+    ]
+    if content_texts:
+        return "\n\n".join(content_texts)
+    return ""
+
+
+def _serialize_reasoning_item(item: Mapping[str, Any]) -> str | None:
+    try:
+        return json.dumps(item, separators=(",", ":"), sort_keys=True)
+    except TypeError:
+        return None
 
 
 def _extract_tool_call(item: Mapping[str, Any]) -> ToolCall | None:
@@ -912,11 +1157,13 @@ def _extract_usage(usage_data: Any) -> Usage:
     if isinstance(input_details, Mapping):
         cache_read = _as_int(input_details.get("cached_tokens"))
 
+    non_cached_input_tokens = max(0, input_tokens - cache_read)
+
     if total_tokens == 0:
-        total_tokens = input_tokens + output_tokens
+        total_tokens = non_cached_input_tokens + output_tokens + cache_read
 
     return Usage(
-        input=input_tokens,
+        input=non_cached_input_tokens,
         output=output_tokens,
         cache_read=cache_read,
         cache_write=0,
@@ -953,10 +1200,8 @@ def _assistant_error_message(
 def _map_reasoning_effort(reasoning: ThinkingLevel | None) -> str | None:
     if reasoning in {None, "off"}:
         return None
-    if reasoning in {"minimal", "low"}:
-        return "low"
-    if reasoning == "medium":
-        return "medium"
+    if reasoning in {"minimal", "low", "medium"}:
+        return reasoning
     return "high"
 
 
@@ -1024,7 +1269,9 @@ def _event_to_mapping(event: Mapping[str, Any] | Any) -> dict[str, Any]:
         "name",
         "output_index",
         "content_index",
+        "summary_index",
         "arguments",
+        "part",
         "item",
         "output_item",
         "response",

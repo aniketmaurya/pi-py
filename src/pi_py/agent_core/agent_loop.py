@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable
+import json
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from typing import Any, TypeVar, cast
+
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema.exceptions import ValidationError  # type: ignore[import-untyped]
 
 from .event_stream import EventStream
 from .types import (
@@ -295,6 +299,8 @@ async def _execute_tool_calls(
             if tool is None:
                 raise RuntimeError(f"Tool {tool_name} not found")
 
+            validated_args = _validate_tool_arguments(tool=tool, tool_call=tool_call)
+
             def on_update(
                 partial: AgentToolResult[Any],
                 *,
@@ -314,7 +320,7 @@ async def _execute_tool_calls(
 
             result = await tool.execute(
                 tool_call_id,
-                tool_args,
+                validated_args,
                 abort_event,
                 on_update,
             )
@@ -412,3 +418,65 @@ async def _maybe_get_messages(
 
     messages = await _maybe_await(getter())
     return list(messages or [])
+
+
+def _validate_tool_arguments(
+    *,
+    tool: AgentTool,
+    tool_call: ToolCall,
+) -> dict[str, Any]:
+    arguments: Any = tool_call.arguments
+    if not isinstance(arguments, Mapping):
+        raise RuntimeError(
+            f'Tool "{tool_call.name}" produced non-object arguments. '
+            f"Expected JSON object, got {type(arguments).__name__}."
+        )
+
+    schema = tool.parameters
+    if schema is None:
+        return {str(key): value for key, value in arguments.items()}
+
+    if not isinstance(schema, Mapping):
+        raise RuntimeError(
+            f'Tool "{tool.name}" has an invalid parameter schema. '
+            f"Expected mapping, got {type(schema).__name__}."
+        )
+
+    validator = Draft202012Validator(dict(schema))
+    errors = sorted(
+        validator.iter_errors(arguments),
+        key=lambda error: _validation_error_path(error),
+    )
+    if errors:
+        raise RuntimeError(
+            _format_tool_validation_error(tool_name=tool_call.name, args=arguments, errors=errors)
+        )
+
+    return {str(key): value for key, value in arguments.items()}
+
+
+def _validation_error_path(error: ValidationError) -> str:
+    if error.path:
+        return ".".join(str(part) for part in error.path)
+    return "root"
+
+
+def _format_tool_validation_error(
+    *,
+    tool_name: str,
+    args: Mapping[str, Any],
+    errors: list[ValidationError],
+) -> str:
+    lines = [f'Validation failed for tool "{tool_name}":']
+    for error in errors:
+        lines.append(f"  - {_validation_error_path(error)}: {error.message}")
+
+    try:
+        rendered_args = json.dumps(args, indent=2, sort_keys=True)
+    except TypeError:
+        rendered_args = str(args)
+
+    lines.append("")
+    lines.append("Received arguments:")
+    lines.append(rendered_args)
+    return "\n".join(lines)

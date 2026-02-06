@@ -17,6 +17,7 @@ from pi_py.agent_core import (
     Model,
     TextContent,
     ToolCall,
+    ToolResultMessage,
     Usage,
     UserMessage,
     agent_loop,
@@ -253,3 +254,88 @@ async def test_agent_loop_skips_remaining_tools_when_steering_arrives() -> None:
     assert len(tool_end_events) == 2
     assert tool_end_events[0]["is_error"] is False
     assert tool_end_events[1]["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_returns_validation_error_for_invalid_tool_arguments() -> None:
+    executed = False
+
+    async def run_tool(
+        tool_call_id: str,
+        params: Mapping[str, Any],
+        abort_event: asyncio.Event | None = None,
+        on_update: Callable[[AgentToolResult[Any]], None] | None = None,
+    ) -> AgentToolResult[Any]:
+        nonlocal executed
+        del tool_call_id, params, abort_event, on_update
+        executed = True
+        return AgentToolResult(content=[TextContent(text="ok")], details={})
+
+    tool = AgentTool(
+        name="echo",
+        label="Echo",
+        description="Echo tool",
+        parameters={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+        },
+        execute=run_tool,
+    )
+
+    prompt = UserMessage(content="run validation")
+    context = AgentContext(system_prompt="", messages=[], tools=[tool])
+    config = AgentLoopConfig(
+        model=make_model(),
+        convert_to_llm=default_convert_to_llm,
+    )
+
+    call_count = 0
+
+    def stream_fn(
+        _model: Model,
+        _context: LlmContext,
+        _config: AgentLoopConfig,
+        _abort_event: asyncio.Event | None,
+    ) -> AssistantMessageEventStream:
+        nonlocal call_count
+        if call_count == 0:
+            call_count += 1
+            return make_stream(
+                {
+                    "type": "done",
+                    "reason": "toolUse",
+                    "message": make_assistant(
+                        [ToolCall(id="call-1", name="echo", arguments={})],
+                        stop_reason="toolUse",
+                    ),
+                }
+            )
+
+        return make_stream(
+            {
+                "type": "done",
+                "reason": "stop",
+                "message": make_assistant([TextContent(text="after error")]),
+            }
+        )
+
+    stream = agent_loop([prompt], context, config, stream_fn=stream_fn)
+    events: list[dict[str, Any]] = []
+    async for event in stream:
+        events.append(event)
+    result_messages = await stream.result()
+
+    tool_end_events = [event for event in events if event["type"] == "tool_execution_end"]
+
+    assert executed is False
+    assert len(tool_end_events) == 1
+    assert tool_end_events[0]["is_error"] is True
+    result = tool_end_events[0]["result"]
+    assert "Validation failed for tool \"echo\"" in result.content[0].text
+
+    tool_result_messages = [
+        message for message in result_messages if isinstance(message, ToolResultMessage)
+    ]
+    assert len(tool_result_messages) == 1
+    assert tool_result_messages[0].is_error is True

@@ -11,9 +11,11 @@ from pi_py.agent_core import (
     AgentToolResult,
     AssistantMessage,
     AssistantMessageEvent,
+    ImageContent,
     LlmContext,
     Model,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResultMessage,
     UserMessage,
@@ -223,6 +225,153 @@ async def test_openai_provider_sends_tool_result_as_function_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openai_provider_sends_tool_result_images_as_follow_up_user_input() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    async def request_fn(
+        payload: dict[str, Any],
+        _api_key: str,
+        _base_url: str | None,
+    ) -> Mapping[str, Any]:
+        seen_payloads.append(payload)
+        return {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Received image"}],
+                }
+            ],
+        }
+
+    provider = OpenAIResponsesProvider(request_fn=request_fn)
+    request = PiAIRequest(
+        model=Model(id="gpt-5", provider="openai", api="openai"),
+        context=LlmContext(
+            messages=[
+                UserMessage(content="Show tool image result"),
+                ToolResultMessage(
+                    tool_call_id="call_image",
+                    tool_name="generate_chart",
+                    content=[
+                        TextContent(text="Chart generated"),
+                        ImageContent(data="aGVsbG8=", mime_type="image/png"),
+                    ],
+                    is_error=False,
+                ),
+            ]
+        ),
+        api_key="test-key",
+    )
+
+    stream = await provider.stream(request)
+    async for _ in stream:
+        pass
+    _ = await stream.result()
+
+    input_items = seen_payloads[0]["input"]
+    function_output_items = [
+        item for item in input_items if item.get("type") == "function_call_output"
+    ]
+    assert len(function_output_items) == 1
+    assert function_output_items[0]["call_id"] == "call_image"
+    assert function_output_items[0]["output"] == "Chart generated"
+
+    image_user_items = [
+        item
+        for item in input_items
+        if item.get("role") == "user"
+        and isinstance(item.get("content"), list)
+        and any(
+            isinstance(part, Mapping) and part.get("type") == "input_image"
+            for part in item["content"]
+        )
+    ]
+    assert len(image_user_items) == 1
+    image_content = image_user_items[0]["content"]
+    assert image_content[0]["type"] == "input_text"
+    assert image_content[1]["type"] == "input_image"
+    assert image_content[1]["image_url"].startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_normalizes_cached_usage_tokens() -> None:
+    async def request_fn(
+        _payload: dict[str, Any],
+        _api_key: str,
+        _base_url: str | None,
+    ) -> Mapping[str, Any]:
+        return {
+            "status": "completed",
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "total_tokens": 150,
+                "input_tokens_details": {"cached_tokens": 20},
+            },
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done"}],
+                }
+            ],
+        }
+
+    provider = OpenAIResponsesProvider(request_fn=request_fn)
+    request = PiAIRequest(
+        model=Model(id="gpt-5", provider="openai", api="openai"),
+        context=LlmContext(messages=[UserMessage(content="hello")]),
+        api_key="test-key",
+    )
+
+    stream = await provider.stream(request)
+    async for _ in stream:
+        pass
+    message = await stream.result()
+
+    assert message.usage.input == 100
+    assert message.usage.output == 30
+    assert message.usage.cache_read == 20
+    assert message.usage.total_tokens == 150
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_preserves_minimal_reasoning_effort() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    async def request_fn(
+        payload: dict[str, Any],
+        _api_key: str,
+        _base_url: str | None,
+    ) -> Mapping[str, Any]:
+        seen_payloads.append(payload)
+        return {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                }
+            ],
+        }
+
+    provider = OpenAIResponsesProvider(request_fn=request_fn)
+    request = PiAIRequest(
+        model=Model(id="gpt-5-mini", provider="openai", api="openai"),
+        context=LlmContext(messages=[UserMessage(content="hello")]),
+        reasoning="minimal",
+        api_key="test-key",
+    )
+
+    stream = await provider.stream(request)
+    async for _ in stream:
+        pass
+    _ = await stream.result()
+
+    assert seen_payloads[0]["reasoning"] == {"effort": "minimal"}
+
+
+@pytest.mark.asyncio
 async def test_openai_provider_streams_text_deltas() -> None:
     async def stream_request_fn(
         _payload: dict[str, Any],
@@ -380,6 +529,109 @@ async def test_openai_provider_streams_tool_call_updates() -> None:
     assert message.stop_reason == "toolUse"
     assert len(tool_calls) == 1
     assert tool_calls[0].arguments == {"city": "Tokyo"}
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_streams_reasoning_events() -> None:
+    async def stream_request_fn(
+        _payload: dict[str, Any],
+        _api_key: str,
+        _base_url: str | None,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        async def _events() -> AsyncIterator[Mapping[str, Any]]:
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1", "summary": []},
+            }
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "item_id": "rs_1",
+                "summary_index": 0,
+                "delta": "Reason one",
+            }
+            yield {
+                "type": "response.reasoning_summary_part.done",
+                "output_index": 0,
+                "item_id": "rs_1",
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": "Reason one"},
+            }
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "item_id": "rs_1",
+                "summary_index": 1,
+                "delta": "Reason two",
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [
+                        {"type": "summary_text", "text": "Reason one\n\nReason two"},
+                    ],
+                },
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "index": 0, "text": "Final answer"},
+                    ],
+                },
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_1",
+                            "summary": [
+                                {"type": "summary_text", "text": "Reason one\n\nReason two"},
+                            ],
+                        },
+                        {
+                            "type": "message",
+                            "content": [
+                                {"type": "output_text", "text": "Final answer"},
+                            ],
+                        },
+                    ],
+                },
+            }
+
+        return _events()
+
+    provider = OpenAIResponsesProvider(stream_request_fn=stream_request_fn)
+    request = PiAIRequest(
+        model=Model(id="gpt-5", provider="openai", api="openai"),
+        context=LlmContext(messages=[UserMessage(content="Explain briefly")]),
+        api_key="test-key",
+    )
+
+    stream = await provider.stream(request)
+    event_types: list[str] = []
+    async for event in stream:
+        event_types.append(event["type"])
+    message = await stream.result()
+
+    thinking_blocks = [
+        block for block in message.content if isinstance(block, ThinkingContent)
+    ]
+    assert "thinking_start" in event_types
+    assert "thinking_end" in event_types
+    assert message.stop_reason == "stop"
+    assert len(thinking_blocks) == 1
+    assert "Reason one" in thinking_blocks[0].thinking
+    assert thinking_blocks[0].thinking_signature is not None
 
 
 def test_event_to_mapping_uses_warnings_false_for_model_dump() -> None:
